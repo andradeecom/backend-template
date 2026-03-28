@@ -16,7 +16,7 @@ This is a backend template with NestJS and TypeScript.
 - [x] Swagger Documentation
 - [x] Prisma ORM
 - [x] Resend (Email Service)
-- [ ] Login with Google (Social Login)
+- [x] Login with Google (Social Login)
 - [ ] Login with Apple (Social Login)
 
 ---

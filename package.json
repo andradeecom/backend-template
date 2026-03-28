@@ -1,13 +1,12 @@
 {
   "name": "backend-template",
   "version": "0.1.0",
-  "description": "",
+  "description": "This is a backend template with NestJS and TypeScript.",
   "author": {
     "name": "Eduardo Andrade",
     "email": "eduardo@andradee.com"
   },
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "MIT",
   "engines": {
     "node": ">= 24.14.0"
   },
