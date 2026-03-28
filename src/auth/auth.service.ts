@@ -7,20 +7,29 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
+import { OAuth2Client } from 'google-auth-library';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
+import { AuthProvider } from '../generated/prisma/client';
 import { LoginDto, ChangePasswordDto, ForgotPasswordDto } from './dto';
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
+  private readonly googleClient: OAuth2Client;
+
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
     private configService: ConfigService,
     private emailService: EmailService,
-  ) {}
+  ) {
+    this.googleClient = new OAuth2Client(
+      this.configService.get<string>('GOOGLE_CLIENT_ID'),
+    );
+  }
 
   async me(userId: string) {
     const user = await this.prisma.user.findUnique({
@@ -35,6 +44,7 @@ export class AuthService {
       firstName: user.firstName,
       lastName: user.lastName,
       role: user.role,
+      profileImageUrl: user.profileImageUrl,
       mustChangePassword: user.mustChangePassword,
     };
   }
@@ -76,6 +86,7 @@ export class AuthService {
         firstName: user.firstName,
         lastName: user.lastName,
         role: user.role,
+        profileImageUrl: user.profileImageUrl,
         mustChangePassword: user.mustChangePassword,
       },
     };
@@ -160,6 +171,94 @@ export class AuthService {
     return {
       message:
         'If the email exists, you will receive a password recovery email',
+    };
+  }
+
+  async verifyGoogleIdToken(idToken: string) {
+    try {
+      const ticket = await this.googleClient.verifyIdToken({
+        idToken,
+        audience: this.configService.get<string>('GOOGLE_CLIENT_ID'),
+      });
+
+      const payload = ticket.getPayload();
+      if (!payload || !payload.email) {
+        throw new UnauthorizedException('Invalid Google ID token');
+      }
+
+      return this.googleLogin({
+        googleId: payload.sub,
+        email: payload.email,
+        firstName: payload.given_name ?? '',
+        lastName: payload.family_name ?? '',
+        profileImageUrl: payload.picture ?? null,
+      });
+    } catch (error) {
+      if (error instanceof UnauthorizedException) throw error;
+      this.logger.error('Google ID token verification failed', error);
+      throw new UnauthorizedException('Invalid Google ID token');
+    }
+  }
+
+  async googleLogin(googleUser: {
+    googleId: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+    profileImageUrl?: string | null;
+  }) {
+    let user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ googleId: googleUser.googleId }, { email: googleUser.email }],
+      },
+    });
+
+    if (user && !user.isActive) {
+      throw new UnauthorizedException('Account is deactivated');
+    }
+
+    if (user) {
+      user = await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          googleId: user.googleId ?? googleUser.googleId,
+          profileImageUrl: googleUser.profileImageUrl ?? user.profileImageUrl,
+          lastLoginAt: new Date(),
+        },
+      });
+    } else {
+      const randomPassword = crypto.randomBytes(32).toString('hex');
+      const hashedPassword = await bcrypt.hash(randomPassword, 10);
+
+      user = await this.prisma.user.create({
+        data: {
+          email: googleUser.email,
+          password: hashedPassword,
+          firstName: googleUser.firstName,
+          lastName: googleUser.lastName,
+          googleId: googleUser.googleId,
+          profileImageUrl: googleUser.profileImageUrl ?? null,
+          authProvider: AuthProvider.GOOGLE,
+          mustChangePassword: false,
+          lastLoginAt: new Date(),
+        },
+      });
+    }
+
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+
+    return {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role,
+        profileImageUrl: user.profileImageUrl,
+        mustChangePassword: user.mustChangePassword,
+      },
     };
   }
 

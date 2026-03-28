@@ -14,19 +14,27 @@ enum UserRole {
   ADMIN
 }
 
+enum AuthProvider {
+  LOCAL
+  GOOGLE
+}
+
 model User {
-  id                 String    @id @default(uuid())
-  email              String    @unique
+  id                 String       @id @default(uuid())
+  email              String       @unique
   password           String
   firstName          String
   lastName           String
-  role               UserRole  @default(STUDENT)
-  isActive           Boolean   @default(true)
-  mustChangePassword Boolean   @default(true)
+  role               UserRole     @default(STUDENT)
+  authProvider       AuthProvider @default(LOCAL)
+  googleId           String?      @unique
+  profileImageUrl    String?
+  isActive           Boolean      @default(true)
+  mustChangePassword Boolean      @default(true)
   createdById        String?
   lastLoginAt        DateTime?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
   @@map("users")
 }

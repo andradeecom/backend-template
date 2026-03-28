@@ -4,16 +4,23 @@ import {
   Get,
   Body,
   UseGuards,
+  Req,
   Res,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
-import { LoginDto, ChangePasswordDto, ForgotPasswordDto } from './dto';
+import {
+  LoginDto,
+  ChangePasswordDto,
+  ForgotPasswordDto,
+  GoogleLoginDto,
+} from './dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
+import { GoogleAuthGuard } from './guards/google-auth.guard';
 import { CurrentUser } from '../common/decorators';
 
 @ApiTags('Auth')
@@ -100,5 +107,85 @@ export class AuthController {
     });
 
     return { message: 'Logged out successfully' };
+  }
+
+  // ─── Google Social Login ────────────────────────────────────────────
+
+  @Post('google/token')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: '[Mobile] Google login via ID token',
+    description:
+      'For mobile clients (React Native / Expo). ' +
+      'The client obtains a Google ID token using the native Google Sign-In SDK ' +
+      'and sends it here. The backend verifies the token with Google and issues JWT tokens.',
+  })
+  async googleTokenLogin(
+    @Body() dto: GoogleLoginDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.authService.verifyGoogleIdToken(dto.idToken);
+
+    res.cookie('refresh_token', result.refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
+    return {
+      accessToken: result.accessToken,
+      user: result.user,
+    };
+  }
+
+  @Get('google')
+  @UseGuards(GoogleAuthGuard)
+  @ApiOperation({
+    summary: '[Web] Initiate Google OAuth2 redirect',
+    description:
+      'For web clients. Redirects the user to the Google consent screen. ' +
+      'After granting permission, Google redirects back to GET /auth/google/callback.',
+  })
+  async googleRedirect() {
+    // Guard redirects to Google automatically
+  }
+
+  @Get('google/callback')
+  @UseGuards(GoogleAuthGuard)
+  @ApiOperation({
+    summary: '[Web] Google OAuth2 callback',
+    description:
+      'Handles the redirect from Google after user consent. ' +
+      'Exchanges the authorization code for user profile data, ' +
+      'creates or links the user account, and returns JWT tokens.',
+  })
+  async googleCallback(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const googleUser = req.user as {
+      googleId: string;
+      email: string;
+      firstName: string;
+      lastName: string;
+      profileImageUrl?: string | null;
+    };
+
+    const result = await this.authService.googleLogin(googleUser);
+
+    res.cookie('refresh_token', result.refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
+    return {
+      accessToken: result.accessToken,
+      user: result.user,
+    };
   }
 }
