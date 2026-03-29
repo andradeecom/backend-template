@@ -161,10 +161,7 @@ export class AuthController {
       'Exchanges the authorization code for user profile data, ' +
       'creates or links the user account, and returns JWT tokens.',
   })
-  async googleCallback(
-    @Req() req: Request,
-    @Res({ passthrough: true }) res: Response,
-  ) {
+  async googleCallback(@Req() req: Request, @Res() res: Response) {
     const googleUser = req.user as {
       googleId: string;
       email: string;
@@ -178,14 +175,20 @@ export class AuthController {
     res.cookie('refresh_token', result.refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000,
       path: '/',
     });
 
-    return {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const lang = 'en';
+    const params = new URLSearchParams({
       accessToken: result.accessToken,
-      user: result.user,
-    };
+      user: JSON.stringify(result.user),
+    });
+
+    res.redirect(
+      `${frontendUrl}/${lang}/auth/google/callback?${params.toString()}`,
+    );
   }
 }
