@@ -17,6 +17,7 @@ import {
   ChangePasswordDto,
   ForgotPasswordDto,
   GoogleLoginDto,
+  ExchangeCodeDto,
 } from './dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
@@ -65,15 +66,26 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Refresh access token' })
   async refresh(
-    @CurrentUser() user: { id: string; email: string; role: string },
+    @CurrentUser()
+    user: { id: string; email: string; role: string; rawRefreshToken: string },
+    @Res({ passthrough: true }) res: Response,
   ) {
-    const { accessToken } = await this.authService.refreshToken(
+    const result = await this.authService.refreshToken(
       user.id,
       user.email,
       user.role,
+      user.rawRefreshToken,
     );
 
-    return { accessToken };
+    res.cookie('refresh_token', result.refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
+    return { accessToken: result.accessToken };
   }
 
   @Post('change-password')
@@ -98,7 +110,12 @@ export class AuthController {
   @Post('logout')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Logout and clear refresh token' })
-  logout(@Res({ passthrough: true }) res: Response) {
+  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const rawToken = req.cookies?.['refresh_token'];
+    if (rawToken) {
+      await this.authService.revokeRefreshToken(rawToken);
+    }
+
     res.clearCookie('access_token', {
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
@@ -168,8 +185,7 @@ export class AuthController {
     summary: '[Web] Google OAuth2 callback',
     description:
       'Handles the redirect from Google after user consent. ' +
-      'Exchanges the authorization code for user profile data, ' +
-      'creates or links the user account, and returns JWT tokens.',
+      'Generates a single-use auth code and redirects to the frontend.',
   })
   async googleCallback(@Req() req: Request, @Res() res: Response) {
     const googleUser = req.user as {
@@ -180,25 +196,44 @@ export class AuthController {
       profileImageUrl?: string | null;
     };
 
-    const result = await this.authService.googleLogin(googleUser);
+    const user = await this.authService.upsertGoogleUser(googleUser);
+    const authCode = await this.authService.createAuthCode(user.id);
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const allowedLocales = ['en', 'es', 'pt'];
+    const state = (req.query as Record<string, string>).state;
+    const lang = allowedLocales.includes(state) ? state : 'en';
+
+    res.redirect(
+      `${frontendUrl}/${lang}/auth/google/callback?code=${authCode}`,
+    );
+  }
+
+  @Post('google/exchange')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: '[Web] Exchange auth code for tokens',
+    description:
+      'Exchanges a single-use authorization code (from Google OAuth callback) ' +
+      'for access and refresh tokens.',
+  })
+  async exchangeGoogleCode(
+    @Body() dto: ExchangeCodeDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.authService.exchangeAuthCode(dto.code);
 
     res.cookie('refresh_token', result.refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: 'strict',
       maxAge: 7 * 24 * 60 * 60 * 1000,
       path: '/',
     });
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    const lang = 'en';
-    const params = new URLSearchParams({
+    return {
       accessToken: result.accessToken,
-      user: JSON.stringify(result.user),
-    });
-
-    res.redirect(
-      `${frontendUrl}/${lang}/auth/google/callback?${params.toString()}`,
-    );
+      user: result.user,
+    };
   }
 }
