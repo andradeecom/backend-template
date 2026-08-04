@@ -14,8 +14,12 @@ import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import {
   LoginDto,
+  RegisterDto,
   ChangePasswordDto,
   ForgotPasswordDto,
+  ResetPasswordDto,
+  VerifyEmailDto,
+  ResendVerificationDto,
   GoogleLoginDto,
   ExchangeCodeDto,
 } from './dto';
@@ -37,6 +41,19 @@ export class AuthController {
   @ApiOperation({ summary: 'Get current user' })
   async me(@CurrentUser('id') userId: string) {
     return this.authService.me(userId);
+  }
+
+  @Post('register')
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Register a new account',
+    description:
+      'Creates a STUDENT account and sends a confirmation email. ' +
+      'The role is fixed server-side — elevated roles are assigned by an admin via POST /users.',
+  })
+  async register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto);
   }
 
   @Post('login')
@@ -105,17 +122,55 @@ export class AuthController {
   }
 
   @Post('forgot-password')
+  @Throttle({ default: { ttl: 60000, limit: 3 } })
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Request password reset via email' })
+  @ApiOperation({
+    summary: 'Request a password reset link via email',
+    description:
+      'Always returns the same response whether or not the email exists.',
+  })
   async forgotPassword(@Body() dto: ForgotPasswordDto) {
     return this.authService.forgotPassword(dto);
+  }
+
+  @Post('reset-password')
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Reset password using the emailed token',
+    description:
+      'Consumes the single-use token and revokes all existing sessions.',
+  })
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto);
+  }
+
+  @Post('verify-email')
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Confirm an email address using the emailed token' })
+  async verifyEmail(@Body() dto: VerifyEmailDto) {
+    return this.authService.verifyEmail(dto.token);
+  }
+
+  @Post('resend-verification')
+  @Throttle({ default: { ttl: 60000, limit: 3 } })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Resend the email confirmation link',
+    description:
+      'Always returns the same response whether or not the email exists.',
+  })
+  async resendVerification(@Body() dto: ResendVerificationDto) {
+    return this.authService.resendVerificationEmail(dto.email);
   }
 
   @Post('logout')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Logout and clear refresh token' })
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
-    const rawToken = req.cookies?.['refresh_token'];
+    const cookies = req.cookies as Record<string, string | undefined>;
+    const rawToken = cookies?.['refresh_token'];
     if (rawToken) {
       await this.authService.revokeRefreshToken(rawToken);
     }

@@ -2,17 +2,33 @@ import {
   Injectable,
   UnauthorizedException,
   BadRequestException,
+  ConflictException,
   Logger,
 } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
+import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
-import { AuthProvider } from '../generated/prisma/client';
-import { LoginDto, ChangePasswordDto, ForgotPasswordDto } from './dto';
+import { AuthProvider, UserRole } from '../generated/prisma/client';
+import {
+  LoginDto,
+  RegisterDto,
+  ChangePasswordDto,
+  ForgotPasswordDto,
+  ResetPasswordDto,
+} from './dto';
+
+const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * `expiresIn` is a template literal type (e.g. `'15m'`), not a plain `string`,
+ * so config lookups are read through it rather than through `string`.
+ */
+type ExpiresIn = NonNullable<JwtSignOptions['expiresIn']>;
 
 @Injectable()
 export class AuthService {
@@ -46,6 +62,49 @@ export class AuthService {
       role: user.role,
       profileImageUrl: user.profileImageUrl,
       mustChangePassword: user.mustChangePassword,
+      emailVerifiedAt: user.emailVerifiedAt,
+    };
+  }
+
+  async register(dto: RegisterDto) {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (existing) {
+      throw new ConflictException('Email already in use');
+    }
+
+    const hashedPassword = await bcrypt.hash(dto.password, 10);
+
+    // Self-registration is always the lowest privilege role. The role is never
+    // taken from the request body — elevated roles are assigned by an admin
+    // through POST /users.
+    const user = await this.prisma.user.create({
+      data: {
+        email: dto.email,
+        password: hashedPassword,
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        role: UserRole.STUDENT,
+        authProvider: AuthProvider.LOCAL,
+        mustChangePassword: false,
+      },
+    });
+
+    await this.sendEmailVerification(user.id, user.email, user.firstName);
+
+    return {
+      message:
+        'Registration successful. Check your email to confirm your account.',
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role,
+        emailVerifiedAt: user.emailVerifiedAt,
+      },
     };
   }
 
@@ -181,35 +240,177 @@ export class AuthService {
     });
 
     if (user && user.isActive) {
-      const temporaryPassword = this.generateTemporaryPassword();
-      const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
+      // Invalidate any outstanding reset tokens so only the newest one works.
+      await this.prisma.passwordResetToken.updateMany({
+        where: { userId: user.id, usedAt: null },
+        data: { usedAt: new Date() },
+      });
 
-      await this.prisma.user.update({
-        where: { id: user.id },
+      const { token, tokenHash } = this.createToken();
+
+      await this.prisma.passwordResetToken.create({
         data: {
-          password: hashedPassword,
-          mustChangePassword: true,
+          tokenHash,
+          userId: user.id,
+          expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
         },
       });
 
       try {
-        await this.emailService.sendPasswordRecoveryEmail(
+        await this.emailService.sendPasswordResetEmail(
           user.email,
           user.firstName,
-          temporaryPassword,
+          token,
         );
       } catch (error) {
-        this.logger.error(
-          `Failed to send recovery email to ${dto.email}`,
-          error,
-        );
+        this.logger.error(`Failed to send reset email to ${dto.email}`, error);
       }
     }
 
+    // Always the same response, so the endpoint cannot be used to discover
+    // which emails have accounts.
     return {
-      message:
-        'If the email exists, you will receive a password recovery email',
+      message: 'If the email exists, you will receive a password reset email',
     };
+  }
+
+  async resetPassword(dto: ResetPasswordDto) {
+    if (dto.newPassword !== dto.confirmPassword) {
+      throw new BadRequestException('Passwords do not match');
+    }
+
+    const tokenHash = this.hashToken(dto.token);
+
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+    });
+
+    if (!resetToken || resetToken.usedAt || resetToken.expiresAt < new Date()) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: resetToken.userId },
+    });
+
+    if (!user || !user.isActive) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: user.id },
+        data: { password: hashedPassword, mustChangePassword: false },
+      }),
+      this.prisma.passwordResetToken.update({
+        where: { id: resetToken.id },
+        data: { usedAt: new Date() },
+      }),
+      // A password reset invalidates every existing session.
+      this.prisma.refreshToken.updateMany({
+        where: { userId: user.id, revoked: false },
+        data: { revoked: true },
+      }),
+    ]);
+
+    return { message: 'Password reset successfully' };
+  }
+
+  async verifyEmail(token: string) {
+    const tokenHash = this.hashToken(token);
+
+    const verification = await this.prisma.emailVerificationToken.findUnique({
+      where: { tokenHash },
+    });
+
+    if (
+      !verification ||
+      verification.usedAt ||
+      verification.expiresAt < new Date()
+    ) {
+      throw new BadRequestException('Invalid or expired verification token');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: verification.userId },
+    });
+
+    if (!user) {
+      throw new BadRequestException('Invalid or expired verification token');
+    }
+
+    if (user.emailVerifiedAt) {
+      return { message: 'Email already confirmed' };
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: user.id },
+        data: { emailVerifiedAt: new Date() },
+      }),
+      this.prisma.emailVerificationToken.update({
+        where: { id: verification.id },
+        data: { usedAt: new Date() },
+      }),
+    ]);
+
+    return { message: 'Email confirmed successfully' };
+  }
+
+  async resendVerificationEmail(email: string) {
+    const user = await this.prisma.user.findUnique({ where: { email } });
+
+    if (user && user.isActive && !user.emailVerifiedAt) {
+      await this.sendEmailVerification(user.id, user.email, user.firstName);
+    }
+
+    return {
+      message: 'If the email exists and is unconfirmed, a new link was sent',
+    };
+  }
+
+  private async sendEmailVerification(
+    userId: string,
+    email: string,
+    firstName: string,
+  ) {
+    await this.prisma.emailVerificationToken.updateMany({
+      where: { userId, usedAt: null },
+      data: { usedAt: new Date() },
+    });
+
+    const { token, tokenHash } = this.createToken();
+
+    await this.prisma.emailVerificationToken.create({
+      data: {
+        tokenHash,
+        userId,
+        expiresAt: new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS),
+      },
+    });
+
+    try {
+      await this.emailService.sendEmailVerificationEmail(
+        email,
+        firstName,
+        token,
+      );
+    } catch (error) {
+      // Email delivery failure must not roll back registration — the user can
+      // request a new link via POST /auth/resend-verification.
+      this.logger.error(`Failed to send verification email to ${email}`, error);
+    }
+  }
+
+  private createToken(): { token: string; tokenHash: string } {
+    const token = crypto.randomBytes(32).toString('hex');
+    return { token, tokenHash: this.hashToken(token) };
+  }
+
+  private hashToken(token: string): string {
+    return crypto.createHash('sha256').update(token).digest('hex');
   }
 
   async verifyGoogleIdToken(idToken: string) {
@@ -261,6 +462,8 @@ export class AuthService {
         data: {
           googleId: user.googleId ?? googleUser.googleId,
           profileImageUrl: googleUser.profileImageUrl ?? user.profileImageUrl,
+          // Google has already verified ownership of the address.
+          emailVerifiedAt: user.emailVerifiedAt ?? new Date(),
           lastLoginAt: new Date(),
         },
       });
@@ -278,6 +481,7 @@ export class AuthService {
           profileImageUrl: googleUser.profileImageUrl ?? null,
           authProvider: AuthProvider.GOOGLE,
           mustChangePassword: false,
+          emailVerifiedAt: new Date(),
           lastLoginAt: new Date(),
         },
       });
@@ -395,12 +599,12 @@ export class AuthService {
     const family = familyId ?? crypto.randomUUID();
 
     const refreshExpiresIn =
-      this.configService.get('JWT_REFRESH_EXPIRES_IN') ?? '7d';
+      this.configService.get<ExpiresIn>('JWT_REFRESH_EXPIRES_IN') ?? '7d';
 
     const [accessToken, refreshToken] = await Promise.all([
       this.jwtService.signAsync(payload, {
         secret: this.configService.get<string>('JWT_SECRET'),
-        expiresIn: this.configService.get('JWT_EXPIRES_IN') ?? '15m',
+        expiresIn: this.configService.get<ExpiresIn>('JWT_EXPIRES_IN') ?? '15m',
       }),
       this.jwtService.signAsync(payload, {
         secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
@@ -415,7 +619,10 @@ export class AuthService {
     return { accessToken, refreshToken, familyId: family };
   }
 
-  private parseExpiresIn(value: string): number {
+  private parseExpiresIn(value: ExpiresIn): number {
+    // jsonwebtoken treats a bare number as seconds.
+    if (typeof value === 'number') return value * 1000;
+
     const match = value.match(/^(\d+)([smhd])$/);
     if (!match) return 7 * 24 * 60 * 60 * 1000;
     const num = parseInt(match[1], 10);

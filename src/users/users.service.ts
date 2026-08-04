@@ -168,6 +168,7 @@ export class UsersService {
       googleId: user.googleId,
       profileImageUrl: user.profileImageUrl,
       mustChangePassword: user.mustChangePassword,
+      emailVerifiedAt: user.emailVerifiedAt,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
       createdById: user.createdById,
