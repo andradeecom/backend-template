@@ -4,13 +4,13 @@ import {
   ConflictException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { AuthService } from '../auth.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { EmailService } from '../../email/email.service';
+import { SessionService } from '../session/session.service';
 import { AuthProvider, UserRole } from '../../generated/prisma/client';
 
 const hashToken = (token: string) =>
@@ -44,7 +44,7 @@ describe('AuthService', () => {
   let service: AuthService;
   let prisma: {
     user: Record<string, jest.Mock>;
-    refreshToken: Record<string, jest.Mock>;
+    session: Record<string, jest.Mock>;
     passwordResetToken: Record<string, jest.Mock>;
     emailVerificationToken: Record<string, jest.Mock>;
     authCode: Record<string, jest.Mock>;
@@ -60,11 +60,12 @@ describe('AuthService', () => {
         create: jest.fn(),
         update: jest.fn(),
       },
-      refreshToken: {
+      session: {
         create: jest.fn(),
         findUnique: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn(),
+        deleteMany: jest.fn(),
       },
       passwordResetToken: {
         create: jest.fn(),
@@ -101,18 +102,23 @@ describe('AuthService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: EmailService, useValue: emailService },
         {
-          provide: JwtService,
-          useValue: { signAsync: jest.fn().mockResolvedValue('signed-token') },
+          provide: SessionService,
+          useValue: {
+            create: jest.fn().mockResolvedValue({
+              rawId: 'session-id',
+              expiresAt: new Date(Date.now() + 1000),
+            }),
+            revoke: jest.fn(),
+            revokeAllForUser: jest.fn(),
+            writeCookie: jest.fn(),
+            clearCookie: jest.fn(),
+          },
         },
         {
           provide: ConfigService,
           useValue: {
             get: jest.fn((key: string) => {
               const values: Record<string, string> = {
-                JWT_SECRET: 'access-secret',
-                JWT_REFRESH_SECRET: 'refresh-secret',
-                JWT_EXPIRES_IN: '15m',
-                JWT_REFRESH_EXPIRES_IN: '7d',
                 GOOGLE_CLIENT_ID: 'google-client-id',
               };
               return values[key];
@@ -230,18 +236,20 @@ describe('AuthService', () => {
   });
 
   describe('login', () => {
-    it('returns tokens for valid credentials', async () => {
+    it('returns the user for valid credentials without any token', async () => {
       const password = await bcrypt.hash('password123', 10);
       prisma.user.findUnique.mockResolvedValue(buildUser({ password }));
       prisma.user.update.mockResolvedValue(buildUser({ password }));
-      prisma.refreshToken.create.mockResolvedValue({});
 
       const result = await service.login({
         email: 'user@example.com',
         password: 'password123',
       });
 
-      expect(result.accessToken).toBe('signed-token');
+      // The session is minted by the controller; the service only vouches for
+      // the user, and never hands back anything token-shaped.
+      expect(result).not.toHaveProperty('accessToken');
+      expect(result).not.toHaveProperty('refreshToken');
       expect(result.user.email).toBe('user@example.com');
       expect(result.user).not.toHaveProperty('password');
     });
@@ -380,7 +388,7 @@ describe('AuthService', () => {
       expect(data.mustChangePassword).toBe(false);
     });
 
-    it('revokes existing refresh tokens so old sessions cannot continue', async () => {
+    it('deletes every session so old ones cannot continue', async () => {
       prisma.passwordResetToken.findUnique.mockResolvedValue(
         validResetRecord(),
       );
@@ -392,9 +400,8 @@ describe('AuthService', () => {
         confirmPassword: 'newPassword123',
       });
 
-      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
-        where: { userId: 'user-1', revoked: false },
-        data: { revoked: true },
+      expect(prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: { userId: 'user-1' },
       });
     });
 
@@ -677,65 +684,6 @@ describe('AuthService', () => {
           prisma.user.update,
         ).data.mustChangePassword,
       ).toBe(false);
-    });
-  });
-
-  describe('refreshToken', () => {
-    it('rotates the token and revokes the one that was used', async () => {
-      prisma.refreshToken.findUnique.mockResolvedValue({
-        id: 'token-1',
-        familyId: 'family-1',
-        revoked: false,
-      });
-      prisma.refreshToken.create.mockResolvedValue({});
-
-      const result = await service.refreshToken(
-        'user-1',
-        'user@example.com',
-        UserRole.STUDENT,
-        'raw-refresh-token',
-      );
-
-      expect(result.accessToken).toBe('signed-token');
-      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
-        where: { id: 'token-1' },
-        data: { revoked: true },
-      });
-    });
-
-    it('revokes the whole family when a revoked token is replayed', async () => {
-      prisma.refreshToken.findUnique.mockResolvedValue({
-        id: 'token-1',
-        familyId: 'family-1',
-        revoked: true,
-      });
-
-      await expect(
-        service.refreshToken(
-          'user-1',
-          'user@example.com',
-          UserRole.STUDENT,
-          'raw-refresh-token',
-        ),
-      ).rejects.toThrow(UnauthorizedException);
-
-      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
-        where: { familyId: 'family-1' },
-        data: { revoked: true },
-      });
-    });
-
-    it('rejects an unknown refresh token', async () => {
-      prisma.refreshToken.findUnique.mockResolvedValue(null);
-
-      await expect(
-        service.refreshToken(
-          'user-1',
-          'user@example.com',
-          UserRole.STUDENT,
-          'raw-refresh-token',
-        ),
-      ).rejects.toThrow(UnauthorizedException);
     });
   });
 
