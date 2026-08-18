@@ -5,13 +5,13 @@ import {
   ConflictException,
   Logger,
 } from '@nestjs/common';
-import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
+import { SessionService } from './session/session.service';
 import { AuthProvider, UserRole } from '../generated/prisma/client';
 import {
   LoginDto,
@@ -24,12 +24,6 @@ import {
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 
-/**
- * `expiresIn` is a template literal type (e.g. `'15m'`), not a plain `string`,
- * so config lookups are read through it rather than through `string`.
- */
-type ExpiresIn = NonNullable<JwtSignOptions['expiresIn']>;
-
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -38,9 +32,9 @@ export class AuthService {
 
   constructor(
     private prisma: PrismaService,
-    private jwtService: JwtService,
     private configService: ConfigService,
     private emailService: EmailService,
+    private sessionService: SessionService,
   ) {
     this.googleClient = new OAuth2Client(
       this.configService.get<string>('GOOGLE_CLIENT_ID'),
@@ -134,11 +128,7 @@ export class AuthService {
       data: { lastLoginAt: new Date() },
     });
 
-    const tokens = await this.generateTokens(user.id, user.email, user.role);
-
     return {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
       user: {
         id: user.id,
         email: user.email,
@@ -148,51 +138,6 @@ export class AuthService {
         profileImageUrl: user.profileImageUrl,
         mustChangePassword: user.mustChangePassword,
       },
-    };
-  }
-
-  async refreshToken(
-    userId: string,
-    email: string,
-    role: string,
-    rawRefreshToken: string,
-  ) {
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(rawRefreshToken)
-      .digest('hex');
-
-    const storedToken = await this.prisma.refreshToken.findUnique({
-      where: { tokenHash },
-    });
-
-    if (!storedToken) {
-      throw new UnauthorizedException('Invalid refresh token');
-    }
-
-    if (storedToken.revoked) {
-      await this.prisma.refreshToken.updateMany({
-        where: { familyId: storedToken.familyId },
-        data: { revoked: true },
-      });
-      throw new UnauthorizedException('Refresh token reuse detected');
-    }
-
-    await this.prisma.refreshToken.update({
-      where: { id: storedToken.id },
-      data: { revoked: true },
-    });
-
-    const tokens = await this.generateTokens(
-      userId,
-      email,
-      role,
-      storedToken.familyId,
-    );
-
-    return {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
     };
   }
 
@@ -230,6 +175,11 @@ export class AuthService {
         mustChangePassword: false,
       },
     });
+
+    // Changing a password signs out every *other* device: if the reason for the
+    // change is that the old password leaked, an attacker's session must not
+    // survive it. The caller's own session is re-issued by the controller.
+    await this.sessionService.revokeAllForUser(userId);
 
     return { message: 'Password changed successfully' };
   }
@@ -308,11 +258,8 @@ export class AuthService {
         where: { id: resetToken.id },
         data: { usedAt: new Date() },
       }),
-      // A password reset invalidates every existing session.
-      this.prisma.refreshToken.updateMany({
-        where: { userId: user.id, revoked: false },
-        data: { revoked: true },
-      }),
+      // A password reset invalidates every existing session, on every device.
+      this.prisma.session.deleteMany({ where: { userId: user.id } }),
     ]);
 
     return { message: 'Password reset successfully' };
@@ -499,11 +446,7 @@ export class AuthService {
   }) {
     const user = await this.upsertGoogleUser(googleUser);
 
-    const tokens = await this.generateTokens(user.id, user.email, user.role);
-
     return {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
       user: {
         id: user.id,
         email: user.email,
@@ -549,11 +492,7 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    const tokens = await this.generateTokens(user.id, user.email, user.role);
-
     return {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
       user: {
         id: user.id,
         email: user.email,
@@ -564,76 +503,6 @@ export class AuthService {
         mustChangePassword: user.mustChangePassword,
       },
     };
-  }
-
-  async revokeRefreshToken(rawToken: string) {
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(rawToken)
-      .digest('hex');
-    await this.prisma.refreshToken.updateMany({
-      where: { tokenHash },
-      data: { revoked: true },
-    });
-  }
-
-  private async storeRefreshToken(
-    token: string,
-    userId: string,
-    familyId: string,
-    expiresAt: Date,
-  ) {
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    await this.prisma.refreshToken.create({
-      data: { tokenHash, userId, familyId, expiresAt, revoked: false },
-    });
-  }
-
-  private async generateTokens(
-    userId: string,
-    email: string,
-    role: string,
-    familyId?: string,
-  ) {
-    const payload = { sub: userId, email, role };
-    const family = familyId ?? crypto.randomUUID();
-
-    const refreshExpiresIn =
-      this.configService.get<ExpiresIn>('JWT_REFRESH_EXPIRES_IN') ?? '7d';
-
-    const [accessToken, refreshToken] = await Promise.all([
-      this.jwtService.signAsync(payload, {
-        secret: this.configService.get<string>('JWT_SECRET'),
-        expiresIn: this.configService.get<ExpiresIn>('JWT_EXPIRES_IN') ?? '15m',
-      }),
-      this.jwtService.signAsync(payload, {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-        expiresIn: refreshExpiresIn,
-      }),
-    ]);
-
-    const ms = this.parseExpiresIn(refreshExpiresIn);
-    const expiresAt = new Date(Date.now() + ms);
-    await this.storeRefreshToken(refreshToken, userId, family, expiresAt);
-
-    return { accessToken, refreshToken, familyId: family };
-  }
-
-  private parseExpiresIn(value: ExpiresIn): number {
-    // jsonwebtoken treats a bare number as seconds.
-    if (typeof value === 'number') return value * 1000;
-
-    const match = value.match(/^(\d+)([smhd])$/);
-    if (!match) return 7 * 24 * 60 * 60 * 1000;
-    const num = parseInt(match[1], 10);
-    const unit = match[2];
-    const multipliers: Record<string, number> = {
-      s: 1000,
-      m: 60 * 1000,
-      h: 60 * 60 * 1000,
-      d: 24 * 60 * 60 * 1000,
-    };
-    return num * (multipliers[unit] ?? 24 * 60 * 60 * 1000);
   }
 
   generateTemporaryPassword(): string {

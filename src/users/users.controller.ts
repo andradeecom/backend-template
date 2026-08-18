@@ -9,18 +9,18 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiCookieAuth } from '@nestjs/swagger';
 import { UsersService } from './users.service';
 import { CreateUserDto, FindAllUsersQueryDto, UpdateUserDto } from './dto';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { SessionGuard } from '../auth/guards/session.guard';
 import { RolesGuard } from '../common/guards';
 import { Roles, CurrentUser } from '../common/decorators';
 import { UserRoleValues } from './types/user-roles.type';
 
 @ApiTags('Users')
-@ApiBearerAuth()
+@ApiCookieAuth()
 @Controller('users')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(SessionGuard, RolesGuard)
 @Roles(UserRoleValues.ADMIN)
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
