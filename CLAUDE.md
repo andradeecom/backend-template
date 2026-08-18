@@ -120,6 +120,11 @@ owns it (`session.service.ts`, `session.constants.ts`).
   so IP-keyed limits would put all users in one bucket and a few page loads
   would 429 everybody. Anonymous requests still fall back to IP, which is the
   right key for login/reset throttling.
+- `TRUST_PROXY` must be `true` when deployed behind a proxy or load balancer, so
+  anonymous limits read the real client IP from `X-Forwarded-For` instead of
+  bucketing every user under the proxy's address. Keep it `false` when the app is
+  directly exposed — otherwise a client can forge that header to reset its own
+  bucket and walk past the login and password-reset limits.
 - Login always mints a fresh id and never adopts one from the request, which is
   what closes session fixation.
 - `mustChangePassword` belongs to the admin-created-user flow (temporary password
