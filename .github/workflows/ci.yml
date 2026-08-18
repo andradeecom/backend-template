@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  # Also run on main itself, so the branch that PRs are measured against is
+  # known-green rather than assumed.
+  push:
+    branches: [main]
+
+# A new push to a PR makes the in-flight run obsolete; cancel it rather than
+# paying for a result nobody will read. Never cancel on main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The Prisma client is generated into src/generated/ and is gitignored, so
+      # nothing typechecks or builds until this runs.
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
+      # --fix is in the package script; CI must not rewrite files and call it a
+      # pass, so the flag is overridden with --max-warnings 0.
+      - name: Lint
+        run: pnpm eslint "{src,apps,libs,test}/**/*.ts" --max-warnings 0
+
+      - name: Unit tests
+        run: pnpm test
+
+      # Runs against the in-memory Prisma mock — no database service container
+      # and no env file needed.
+      - name: E2E tests
+        run: pnpm test:e2e
+
+      - name: Build
+        run: pnpm build
