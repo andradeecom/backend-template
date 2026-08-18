@@ -120,11 +120,18 @@ owns it (`session.service.ts`, `session.constants.ts`).
   so IP-keyed limits would put all users in one bucket and a few page loads
   would 429 everybody. Anonymous requests still fall back to IP, which is the
   right key for login/reset throttling.
-- `TRUST_PROXY` must be `true` when deployed behind a proxy or load balancer, so
-  anonymous limits read the real client IP from `X-Forwarded-For` instead of
-  bucketing every user under the proxy's address. Keep it `false` when the app is
-  directly exposed — otherwise a client can forge that header to reset its own
-  bucket and walk past the login and password-reset limits.
+- `TRUSTED_PROXIES` decides which upstream proxies may be believed about the
+  client IP (see `main.ts`). Accepts a CIDR/IP allow-list — preferred, because
+  trust is pinned to addresses rather than a hop count that can drift — or a hop
+  count. `true` is deliberately unsupported: it makes Express take the left-most,
+  client-supplied `X-Forwarded-For` entry. Never parse that header by hand.
+  Empty is the safe default. Deployment detail belongs in `docs/deployment.md`,
+  not in the README.
+- `SameSite` is `Lax`, not `Strict`, on purpose. `Strict` withholds the cookie on
+  cross-site top-level navigations, so following an emailed verification or
+  reset link would land the user on a logged-out page. `Lax` already blocks
+  cross-site POSTs and subrequests; what it permits is top-level GETs, which is
+  safe only while **GET requests never mutate state** — keep it that way.
 - Login always mints a fresh id and never adopts one from the request, which is
   what closes session fixation.
 - `mustChangePassword` belongs to the admin-created-user flow (temporary password
