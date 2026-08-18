@@ -45,7 +45,7 @@ from `dist/` automatically.
   real database. Provide them via `Test.createTestingModule` overrides.
 - Controller specs mock the service layer entirely and assert HTTP-shaped
   concerns: what the response body contains, which cookies get set/cleared, and
-  that the authenticated user id comes from the JWT rather than the request body.
+  that the authenticated user id comes from the session rather than the request body.
 - DTO specs run `class-validator`'s `validate()` over `plainToInstance` output to
   pin down validation rules (email format, `MinLength`, required fields).
 - Assert security properties explicitly, not just happy paths: passwords are
@@ -80,6 +80,47 @@ every spec.
 - Endpoints that take an email (`forgot-password`, `resend-verification`) return
   an identical response whether or not the account exists, so they cannot be used
   to enumerate users.
-- A completed password reset revokes every outstanding refresh token.
+- A completed password reset deletes every session for that user; a password
+  change deletes every *other* session and re-issues the caller's.
+
+### Sessions
+
+Auth is an opaque, server-backed session — not a JWT. `src/auth/session/`
+owns it (`session.service.ts`, `session.constants.ts`).
+
+- The client holds a 32-byte random id in an httpOnly cookie and nothing else.
+  It carries no claims, so it is useless to read; all authority is the database
+  row it points at. Revocation is a `DELETE`, effective on the next request
+  rather than whenever a signed token would have expired.
+- Only the SHA-256 hash of the id is stored, so a database leak yields no usable
+  sessions.
+- The cookie is `__Host-`-prefixed in production (browser-enforced: `Secure`, no
+  `Domain`, `Path=/`). That requires HTTPS, so local development falls back to
+  the unprefixed `session` name — see `sessionCookieName()`.
+- Ids rotate hourly. A rotated-away id is kept as a revoked row, so replaying it
+  is detectable: presenting one burns the whole `familyId` and forces re-login.
+- Expiry is two-tier — a sliding idle window plus a hard absolute ceiling, so an
+  actively-used stolen session still dies.
+- `SessionGuard` replaces the old `JwtAuthGuard` and resolves the cookie into
+  `req.user`. Routes opt out with `@Public()`.
+- CSRF is defended in three layers, all required because the session rides in a
+  cookie the browser attaches automatically:
+  1. **Double-submit token** (`CsrfGuard`, global). The server sets a *readable*
+     `csrf_token` cookie; clients echo it in `X-CSRF-Token` on mutations.
+     Readable is safe — it is not a credential, and a cross-site page can cause
+     the cookie to be *sent* but cannot read it or set a custom header.
+     Compared in constant time. Skipped for callers with no token cookie
+     (native mobile attaches its session explicitly and is not CSRF-exposed).
+  2. **`SameSite=Lax`** on the session cookie.
+  3. **`Sec-Fetch-Site`** (`OriginGuard`, global) — browsers stamp it and a page
+     cannot forge it, closing the sibling-subdomain gap SameSite leaves. It
+     deliberately rejects `same-site`, not just `cross-site`.
+- Rate limiting uses `SessionThrottlerGuard`, which keys on the **session**, not
+  the IP. Behind a BFF every browser request is relayed by the frontend server,
+  so IP-keyed limits would put all users in one bucket and a few page loads
+  would 429 everybody. Anonymous requests still fall back to IP, which is the
+  right key for login/reset throttling.
+- Login always mints a fresh id and never adopts one from the request, which is
+  what closes session fixation.
 - `mustChangePassword` belongs to the admin-created-user flow (temporary password
   emailed via `sendWelcomeEmail`), not to self-registration.
