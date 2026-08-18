@@ -36,7 +36,7 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('Backend Template API')
     .setDescription('Template for all backend operations')
-    .setVersion('0.1.0')
+    .setVersion('1.0.0')
     // Auth travels as an httpOnly session cookie, never as a bearer token the
     // client could read, so Swagger authenticates by cookie too.
     .addCookieAuth(

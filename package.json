@@ -1,6 +1,6 @@
 {
   "name": "backend-template",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "This is a backend template with NestJS and TypeScript.",
   "author": {
     "name": "Eduardo Andrade",
