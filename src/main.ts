@@ -10,8 +10,18 @@ async function bootstrap() {
   app.use(cookieParser());
   app.setGlobalPrefix('api');
 
+  // `credentials: true` is what lets the browser send the session cookie, so
+  // the allow-list must stay explicit — a wildcard origin would be rejected by
+  // the browser here anyway.
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  if (!allowedOrigins.includes(frontendUrl)) allowedOrigins.push(frontendUrl);
+
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: allowedOrigins,
     credentials: true,
   });
 
@@ -27,7 +37,11 @@ async function bootstrap() {
     .setTitle('Backend Template API')
     .setDescription('Template for all backend operations')
     .setVersion('0.1.0')
-    .addBearerAuth()
+    // Auth travels as an httpOnly session cookie, never as a bearer token the
+    // client could read, so Swagger authenticates by cookie too.
+    .addCookieAuth(
+      process.env.NODE_ENV === 'production' ? '__Host-session' : 'session',
+    )
     .build();
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api/docs', app, document);
