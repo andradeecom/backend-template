@@ -12,7 +12,8 @@ This is a backend template with NestJS and TypeScript.
 - [x] Lint-staged
 - [x] Jest
 - [x] Supertest
-- [x] JWT Strategy
+- [x] Opaque server-side sessions (httpOnly cookies, rotation + reuse detection)
+- [x] CSRF protection (double-submit token, SameSite, Sec-Fetch-Site)
 - [x] Swagger Documentation
 - [x] Prisma ORM
 - [x] Resend (Email Service)
