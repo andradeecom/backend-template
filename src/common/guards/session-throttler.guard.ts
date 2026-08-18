@@ -32,15 +32,11 @@ export class SessionThrottlerGuard extends ThrottlerGuard {
       return `session:${digest}`;
     }
 
-    // Trust a forwarded address only when the proxy is ours, otherwise a client
-    // could spoof the header and dodge the anonymous limits entirely.
-    const trustedProxy = process.env.TRUST_PROXY === 'true';
-    if (trustedProxy) {
-      const forwarded = req.headers?.['x-forwarded-for'] as string | undefined;
-      const clientIp = forwarded?.split(',')[0]?.trim();
-      if (clientIp) return `ip:${clientIp}`;
-    }
-
+    // `req.ip` is already correct: Express derives it from X-Forwarded-For using
+    // the `trust proxy` hop count configured in main.ts, counting from the right
+    // of the chain so client-supplied entries are ignored. Parsing the header
+    // here instead would take the left-most value — the part an attacker
+    // controls — handing them a fresh bucket per request.
     return `ip:${req.ip}`;
   }
 }
