@@ -37,27 +37,37 @@ model User {
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 
-  refreshTokens      RefreshToken[]
+  sessions           Session[]
   passwordResets     PasswordResetToken[]
   emailVerifications EmailVerificationToken[]
 
   @@map("users")
 }
 
-model RefreshToken {
-  id        String   @id @default(uuid())
-  tokenHash String   @unique
-  userId    String
-  familyId  String
-  expiresAt DateTime
-  revoked   Boolean  @default(false)
-  createdAt DateTime @default(now())
+model Session {
+  id                String   @id @default(uuid())
+  /// SHA-256 of the opaque session id handed to the client. The raw value is
+  /// never stored, so a database leak does not yield usable sessions.
+  tokenHash         String   @unique
+  userId            String
+  /// Sessions rotated from one another share a family. Presenting a rotated-away
+  /// id burns the whole family — that is the reuse detection.
+  familyId          String
+  expiresAt         DateTime
+  /// Absolute cap: rotation extends `expiresAt` but never past this.
+  absoluteExpiresAt DateTime
+  revoked           Boolean  @default(false)
+  userAgent         String?
+  ipAddress         String?
+  lastUsedAt        DateTime @default(now())
+  createdAt         DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([familyId])
   @@index([userId])
-  @@map("refresh_tokens")
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 model AuthCode {

@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import type { Request, Response } from 'express';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
+import { SessionService } from '../session/session.service';
 import { UserRole } from '../../generated/prisma/client';
 
 const buildResponse = () =>
@@ -15,31 +16,50 @@ const buildResponse = () =>
     redirect: jest.Mock;
   };
 
+const buildRequest = (cookies: Record<string, string> = {}) =>
+  ({ cookies, get: () => undefined, ip: '127.0.0.1' }) as unknown as Request;
+
 describe('AuthController', () => {
   let controller: AuthController;
   let authService: Record<string, jest.Mock>;
+  let sessionService: Record<string, jest.Mock> & { cookieName: string };
 
   beforeEach(async () => {
     authService = {
       me: jest.fn(),
       register: jest.fn(),
       login: jest.fn(),
-      refreshToken: jest.fn(),
       changePassword: jest.fn(),
       forgotPassword: jest.fn(),
       resetPassword: jest.fn(),
       verifyEmail: jest.fn(),
       resendVerificationEmail: jest.fn(),
-      revokeRefreshToken: jest.fn(),
       verifyGoogleIdToken: jest.fn(),
       upsertGoogleUser: jest.fn(),
       createAuthCode: jest.fn(),
       exchangeAuthCode: jest.fn(),
     };
 
+    sessionService = Object.assign(
+      {
+        create: jest.fn().mockResolvedValue({
+          rawId: 'new-session-id',
+          expiresAt: new Date(Date.now() + 1000),
+        }),
+        writeCookie: jest.fn(),
+        clearCookie: jest.fn(),
+        revoke: jest.fn(),
+        revokeAllForUser: jest.fn(),
+      },
+      { cookieName: 'session' },
+    );
+
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: authService }],
+      providers: [
+        { provide: AuthService, useValue: authService },
+        { provide: SessionService, useValue: sessionService },
+      ],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);
@@ -88,43 +108,61 @@ describe('AuthController', () => {
   });
 
   describe('POST /auth/login', () => {
-    it('returns the access token and sets the refresh cookie', async () => {
+    it('starts a session and plants it in a cookie, returning only the user', async () => {
       authService.login.mockResolvedValue({
-        accessToken: 'access-token',
-        refreshToken: 'refresh-token',
         user: { id: 'user-1', email: 'user@example.com' },
       });
       const res = buildResponse();
 
       const result = await controller.login(
         { email: 'user@example.com', password: 'password123' },
+        buildRequest(),
         res,
       );
 
       expect(result).toEqual({
-        accessToken: 'access-token',
         user: { id: 'user-1', email: 'user@example.com' },
       });
-      expect(res.cookie).toHaveBeenCalledWith(
-        'refresh_token',
-        'refresh-token',
-        expect.objectContaining({ httpOnly: true, sameSite: 'strict' }),
+      expect(sessionService.create).toHaveBeenCalledWith(
+        'user-1',
+        expect.anything(),
+      );
+      expect(sessionService.writeCookie).toHaveBeenCalledWith(
+        res,
+        'new-session-id',
+        expect.any(Date),
       );
     });
 
-    it('never returns the refresh token in the response body', async () => {
-      authService.login.mockResolvedValue({
-        accessToken: 'access-token',
-        refreshToken: 'refresh-token',
-        user: { id: 'user-1' },
-      });
+    it('never puts a credential in the response body', async () => {
+      authService.login.mockResolvedValue({ user: { id: 'user-1' } });
 
       const result = await controller.login(
         { email: 'user@example.com', password: 'password123' },
+        buildRequest(),
         buildResponse(),
       );
 
+      expect(result).not.toHaveProperty('accessToken');
       expect(result).not.toHaveProperty('refreshToken');
+      expect(result).not.toHaveProperty('sessionId');
+    });
+
+    it('mints a fresh session id rather than honouring one supplied by the client', async () => {
+      authService.login.mockResolvedValue({ user: { id: 'user-1' } });
+
+      await controller.login(
+        { email: 'user@example.com', password: 'password123' },
+        buildRequest({ session: 'attacker-planted-id' }),
+        buildResponse(),
+      );
+
+      // Session fixation: the incoming cookie must never be adopted.
+      expect(sessionService.writeCookie).toHaveBeenCalledWith(
+        expect.anything(),
+        'new-session-id',
+        expect.any(Date),
+      );
     });
   });
 
@@ -157,10 +195,13 @@ describe('AuthController', () => {
         newPassword: 'newPassword123',
         confirmPassword: 'newPassword123',
       };
-      const result = await controller.resetPassword(dto);
+      const res = buildResponse();
+      const result = await controller.resetPassword(dto, res);
 
       expect(authService.resetPassword).toHaveBeenCalledWith(dto);
       expect(result).toEqual({ message: 'Password reset successfully' });
+      // Every session for the user is gone, so the caller's cookie must go too.
+      expect(sessionService.clearCookie).toHaveBeenCalledWith(res);
     });
   });
 
@@ -202,74 +243,76 @@ describe('AuthController', () => {
         newPassword: 'newPassword123',
         confirmPassword: 'newPassword123',
       };
-      await controller.changePassword('user-1', dto);
+      await controller.changePassword(
+        'user-1',
+        dto,
+        buildRequest(),
+        buildResponse(),
+      );
 
       expect(authService.changePassword).toHaveBeenCalledWith('user-1', dto);
+    });
+
+    it('re-issues a session so the caller survives their own password change', async () => {
+      authService.changePassword.mockResolvedValue({
+        message: 'Password changed successfully',
+      });
+
+      const res = buildResponse();
+      await controller.changePassword(
+        'user-1',
+        {
+          currentPassword: 'oldPassword123',
+          newPassword: 'newPassword123',
+          confirmPassword: 'newPassword123',
+        },
+        buildRequest(),
+        res,
+      );
+
+      expect(sessionService.create).toHaveBeenCalledWith(
+        'user-1',
+        expect.anything(),
+      );
+      expect(sessionService.writeCookie).toHaveBeenCalledWith(
+        res,
+        'new-session-id',
+        expect.any(Date),
+      );
     });
   });
 
   describe('POST /auth/logout', () => {
-    it('revokes the refresh token and clears the auth cookies', async () => {
-      const req = {
-        cookies: { refresh_token: 'refresh-token' },
-      } as unknown as Request;
+    it('deletes the session row and clears the cookie', async () => {
+      const req = buildRequest({ session: 'session-id' });
       const res = buildResponse();
 
       const result = await controller.logout(req, res);
 
-      expect(authService.revokeRefreshToken).toHaveBeenCalledWith(
-        'refresh-token',
-      );
-      const clearedCookies = res.clearCookie.mock.calls.map(
-        (call) => call[0] as string,
-      );
-      expect(clearedCookies).toEqual(
-        expect.arrayContaining(['refresh_token', 'access_token', 'user_data']),
-      );
+      expect(sessionService.revoke).toHaveBeenCalledWith('session-id');
+      expect(sessionService.clearCookie).toHaveBeenCalledWith(res);
       expect(result).toEqual({ message: 'Logged out successfully' });
     });
 
-    it('still clears cookies when no refresh token is present', async () => {
-      const req = { cookies: {} } as unknown as Request;
+    it('still clears the cookie when no session is present', async () => {
       const res = buildResponse();
 
-      await controller.logout(req, res);
+      await controller.logout(buildRequest(), res);
 
-      expect(authService.revokeRefreshToken).not.toHaveBeenCalled();
-      expect(res.clearCookie).toHaveBeenCalled();
+      expect(sessionService.revoke).not.toHaveBeenCalled();
+      expect(sessionService.clearCookie).toHaveBeenCalledWith(res);
     });
   });
 
-  describe('POST /auth/refresh', () => {
-    it('rotates the refresh cookie and returns a new access token', async () => {
-      authService.refreshToken.mockResolvedValue({
-        accessToken: 'new-access-token',
-        refreshToken: 'new-refresh-token',
-      });
+  describe('POST /auth/logout-all', () => {
+    it('revokes every session for the user', async () => {
       const res = buildResponse();
 
-      const result = await controller.refresh(
-        {
-          id: 'user-1',
-          email: 'user@example.com',
-          role: UserRole.STUDENT,
-          rawRefreshToken: 'old-refresh-token',
-        },
-        res,
-      );
+      const result = await controller.logoutAll('user-1', res);
 
-      expect(authService.refreshToken).toHaveBeenCalledWith(
-        'user-1',
-        'user@example.com',
-        UserRole.STUDENT,
-        'old-refresh-token',
-      );
-      expect(result).toEqual({ accessToken: 'new-access-token' });
-      expect(res.cookie).toHaveBeenCalledWith(
-        'refresh_token',
-        'new-refresh-token',
-        expect.objectContaining({ httpOnly: true }),
-      );
+      expect(sessionService.revokeAllForUser).toHaveBeenCalledWith('user-1');
+      expect(sessionService.clearCookie).toHaveBeenCalledWith(res);
+      expect(result).toEqual({ message: 'Logged out from all devices' });
     });
   });
 
